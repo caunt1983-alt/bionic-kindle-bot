@@ -1,24 +1,26 @@
-"""Telegram-бот bionic-конвертер с отправкой на Kindle через Resend HTTPS API.
+"""Telegram-бот bionic-конвертер с отправкой на Kindle через Gmail SMTP.
 
 Флоу:
 1. Ты форвардишь .epub боту в личку (из группы «Бубубу» → «Переслать»).
 2. Бот молча конвертирует через process_epub из bionicize.py.
-3. Бот шлёт результат на твой @kindle.com через HTTP-API Resend.
-4. Через минуту книга на Kindle-приложении.
+3. Бот шлёт результат на @kindle.com через Gmail SMTP (порт 465, SSL).
+4. Через 1–3 минуты книга на Kindle-приложении.
 
 Файлы >20 МБ отбрасывает (лимит Bot API).
+Работает только с BotHost — с локального ПК Gmail SMTP закрыт ISP/VPN.
 """
 from __future__ import annotations
 
 import asyncio
-import base64
 import logging
 import os
+import smtplib
+import ssl
 import sys
 import tempfile
+from email.message import EmailMessage
 from pathlib import Path
 
-import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message
@@ -30,8 +32,8 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0")) or None
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "").replace(" ", "")
 KINDLE_EMAIL = os.getenv("KINDLE_EMAIL")
 
 MAX_SIZE = 20 * 1024 * 1024
@@ -43,28 +45,23 @@ bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
 
-async def send_to_kindle(path: Path, filename: str) -> None:
-    payload = {
-        "from": RESEND_FROM,
-        "to": KINDLE_EMAIL,
-        "subject": filename,
-        "text": "Sent by bionic-kindle-bot",
-        "attachments": [{
-            "filename": filename,
-            "content": base64.b64encode(path.read_bytes()).decode(),
-        }],
-    }
-    headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    timeout = aiohttp.ClientTimeout(total=60)
-    async with aiohttp.ClientSession(timeout=timeout) as s:
-        async with s.post("https://api.resend.com/emails",
-                          json=payload, headers=headers) as r:
-            body = await r.text()
-            if r.status >= 300:
-                raise RuntimeError(f"Resend {r.status}: {body[:300]}")
+def send_to_kindle(path: Path, filename: str) -> None:
+    msg = EmailMessage()
+    msg["From"] = GMAIL_USER
+    msg["To"] = KINDLE_EMAIL
+    msg["Subject"] = filename
+    msg.set_content("Sent by bionic-kindle-bot")
+    with path.open("rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="application",
+            subtype="epub+zip",
+            filename=filename,
+        )
+    ctx = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=60) as s:
+        s.login(GMAIL_USER, GMAIL_APP_PASSWORD)
+        s.send_message(msg)
 
 
 @dp.message(Command("id"))
@@ -124,10 +121,10 @@ async def on_document(message: Message) -> None:
         await status.edit_text(f"📧 Отправляю на Kindle ({docs} док., {words} слов)…")
 
         try:
-            await send_to_kindle(dst, dst.name)
+            await asyncio.to_thread(send_to_kindle, dst, dst.name)
         except Exception as e:
-            log.exception("send_to_kindle failed")
-            await status.edit_text(f"❌ Resend: {e}")
+            log.exception("smtp failed")
+            await status.edit_text(f"❌ SMTP: {e}")
             return
 
     await status.edit_text(f"✓ Отправлено на Kindle: {out_stem}.epub")
@@ -135,14 +132,16 @@ async def on_document(message: Message) -> None:
 
 async def main() -> None:
     missing = [n for n, v in [
-        ("BOT_TOKEN", BOT_TOKEN),
-        ("RESEND_API_KEY", RESEND_API_KEY),
+        ("BOT_TOKEN/API_TOKEN", BOT_TOKEN),
+        ("GMAIL_USER", GMAIL_USER),
+        ("GMAIL_APP_PASSWORD", GMAIL_APP_PASSWORD),
         ("KINDLE_EMAIL", KINDLE_EMAIL),
     ] if not v]
     if missing:
         log.error("Нет обязательных env: %s", ", ".join(missing))
         sys.exit(1)
-    log.info("OWNER_USER_ID=%s FROM=%s TO=%s", OWNER_USER_ID, RESEND_FROM, KINDLE_EMAIL)
+    log.info("OWNER_USER_ID=%s GMAIL_USER=%s KINDLE_EMAIL=%s",
+             OWNER_USER_ID, GMAIL_USER, KINDLE_EMAIL)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 

@@ -1,24 +1,27 @@
-"""Telegram-бот bionic-конвертер.
+"""Telegram-бот bionic-конвертер с отправкой на Kindle через Resend HTTPS API.
 
 Флоу:
 1. Ты форвардишь .epub боту в личку (из группы «Бубубу» → «Переслать»).
 2. Бот молча конвертирует через process_epub из bionicize.py.
-3. Бот присылает bionic-версию обратно в личку.
+3. Бот шлёт результат на твой @kindle.com через HTTP-API Resend.
+4. Через минуту книга на Kindle-приложении.
 
 Файлы >20 МБ отбрасывает (лимит Bot API).
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import sys
 import tempfile
 from pathlib import Path
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import FSInputFile, Message
+from aiogram.types import Message
 from dotenv import load_dotenv
 
 from bionicize import process_epub
@@ -27,6 +30,9 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0")) or None
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
+KINDLE_EMAIL = os.getenv("KINDLE_EMAIL")
 
 MAX_SIZE = 20 * 1024 * 1024
 
@@ -35,6 +41,30 @@ log = logging.getLogger(__name__)
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+
+async def send_to_kindle(path: Path, filename: str) -> None:
+    payload = {
+        "from": RESEND_FROM,
+        "to": KINDLE_EMAIL,
+        "subject": filename,
+        "text": "Sent by bionic-kindle-bot",
+        "attachments": [{
+            "filename": filename,
+            "content": base64.b64encode(path.read_bytes()).decode(),
+        }],
+    }
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with s.post("https://api.resend.com/emails",
+                          json=payload, headers=headers) as r:
+            body = await r.text()
+            if r.status >= 300:
+                raise RuntimeError(f"Resend {r.status}: {body[:300]}")
 
 
 @dp.message(Command("id"))
@@ -91,29 +121,28 @@ async def on_document(message: Message) -> None:
             await status.edit_text("❌ В EPUB не нашлось текста для обработки")
             return
 
+        await status.edit_text(f"📧 Отправляю на Kindle ({docs} док., {words} слов)…")
+
         try:
-            await bot.send_document(
-                chat_id=message.chat.id,
-                document=FSInputFile(dst, filename=dst.name),
-                caption=f"bionic: {docs} док., {words} слов",
-                reply_to_message_id=message.message_id,
-            )
+            await send_to_kindle(dst, dst.name)
         except Exception as e:
-            log.exception("send_document failed")
-            await status.edit_text(f"❌ Не смог отправить: {e}")
+            log.exception("send_to_kindle failed")
+            await status.edit_text(f"❌ Resend: {e}")
             return
 
-    try:
-        await status.delete()
-    except Exception:
-        pass
+    await status.edit_text(f"✓ Отправлено на Kindle: {out_stem}.epub")
 
 
 async def main() -> None:
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN не задан")
+    missing = [n for n, v in [
+        ("BOT_TOKEN", BOT_TOKEN),
+        ("RESEND_API_KEY", RESEND_API_KEY),
+        ("KINDLE_EMAIL", KINDLE_EMAIL),
+    ] if not v]
+    if missing:
+        log.error("Нет обязательных env: %s", ", ".join(missing))
         sys.exit(1)
-    log.info("OWNER_USER_ID=%s", OWNER_USER_ID)
+    log.info("OWNER_USER_ID=%s FROM=%s TO=%s", OWNER_USER_ID, RESEND_FROM, KINDLE_EMAIL)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 

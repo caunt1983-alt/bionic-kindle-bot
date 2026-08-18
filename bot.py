@@ -28,7 +28,7 @@ from bionicize import process_epub
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("API_TOKEN")
 OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0")) or None
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev")
